@@ -1,62 +1,149 @@
+import os
 import cv2
-import torch
+import numpy as np
 from ultralytics import YOLO
-from deep_sort_realtime.deepsort_tracker import DeepSort
-from featureExtraction import FeatureExtractor
+from torchvision import transforms
+from PIL import Image
+from sklearn.metrics.pairwise import cosine_similarity
+import torch
+import torchreid
 
-# Initialize model
-model = YOLO("models/best.pt")  # Use 'yolov8n' for speed
-model.fuse()
+VIDEO_PATH = "../input/15sec_input_720p.mp4"
+MODEL_PATH = "../input/best.pt"
+OUTPUT_DIR = "../output/tracked_frames"
+OUTPUT_VIDEO_PATH = "../output/tracked_video_reid_final.mp4"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Initialize feature extractor
-extractor = FeatureExtractor()
+global_id_counter = 0
+active_tracks = {}
+inactive_gallery = []
 
-# Initialize DeepSORT
-deepsort = DeepSort(max_age=30, n_init=3, nms_max_overlap=1.0)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+reid_model = torchreid.models.build_model('osnet_x1_0', num_classes=1000, pretrained=True)
+reid_model.to(device)
+reid_model.eval()
 
-# Video input
-cap = cv2.VideoCapture(0)  # use webcam; replace with "video.mp4" if needed
+transform = transforms.Compose([
+    transforms.Resize((256, 128)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+def extract_features(image_crop):
+    try:
+        img = Image.fromarray(cv2.cvtColor(image_crop, cv2.COLOR_BGR2RGB))
+        tensor = transform(img).unsqueeze(0).to(device)
+        with torch.no_grad():
+            features = reid_model(tensor)
+        return features.cpu().numpy().flatten()
+    except:
+        return None
 
-    results = model(frame, verbose=False)[0]
-    detections = []
-    crops = []
-    bboxes = []
-    confidences = []
+def match_in_gallery(features, used_global_ids, threshold=0.7):
+    if not inactive_gallery:
+        return None
+    filtered = [g for g in inactive_gallery if g['global_id'] not in used_global_ids]
+    if not filtered:
+        return None
+    gallery_features = [g['features'] for g in filtered]
+    gallery_ids = [g['global_id'] for g in filtered]
+    sims = cosine_similarity([features], gallery_features)[0]
+    best_idx = np.argmax(sims)
+    if sims[best_idx] > threshold:
+        return gallery_ids[best_idx]
+    return None
 
-    for result in results.boxes:
-        cls_id = int(result.cls[0])
-        conf = float(result.conf[0])
-        if cls_id == 2:  # Class ID for 'person' in COCO
-            x1, y1, x2, y2 = map(int, result.xyxy[0])
-            crops.append(frame[y1:y2, x1:x2])
-            bboxes.append([x1, y1, x2 - x1, y2 - y1])  # (x, y, w, h)
-            confidences.append(conf)
+def assign_global_id(track_id, bbox, frame, used_global_ids):
+    global global_id_counter
+    if track_id in active_tracks:
+        global_id = active_tracks[track_id]['global_id']
+        if global_id not in used_global_ids:
+            return global_id
+    x1, y1, x2, y2 = map(int, bbox)
+    crop = frame[y1:y2, x1:x2]
+    features = extract_features(crop)
+    if features is None:
+        return None
+    matched_global_id = match_in_gallery(features, used_global_ids)
+    if matched_global_id is not None:
+        global_id = matched_global_id
+    else:
+        global_id_counter += 1
+        global_id = global_id_counter
+        inactive_gallery.append({'global_id': global_id, 'features': features})
+    active_tracks[track_id] = {'global_id': global_id, 'features': features}
+    used_global_ids.add(global_id)
+    return global_id
 
-    if crops:
-        features = extractor.extract(crops)
-        for bbox, conf, feat in zip(bboxes, confidences, features):
-            detections.append((bbox, conf, feat))
+def retire_lost_tracks(current_track_ids):
+    lost_ids = set(active_tracks.keys()) - set(current_track_ids)
+    for tid in lost_ids:
+        if 'features' in active_tracks[tid]:
+            inactive_gallery.append({
+                'global_id': active_tracks[tid]['global_id'],
+                'features': active_tracks[tid]['features']
+            })
+    for tid in lost_ids:
+        del active_tracks[tid]
 
-        tracks = deepsort.update_tracks(detections, frame=frame)
-
-        for track in tracks:
-            if not track.is_confirmed():
+def draw_frame(frame, results, class_names):
+    annotated = frame.copy()
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.7
+    thickness = 2
+    color_map = {
+        'player': (255, 255, 255),
+        'referee': (0, 215, 255),
+        'goalkeeper': (0, 0, 255)
+    }
+    used_global_ids = set()
+    current_frame_track_ids = []
+    if results.boxes.id is not None and results.boxes.cls is not None:
+          xyxy = results.boxes.xyxy.cpu().numpy()
+          ids = results.boxes.id.cpu().numpy()
+          confs = results.boxes.conf.cpu().numpy()
+          clss = results.boxes.cls.cpu().numpy()
+          for i in range(len(ids)):
+            x1, y1, x2, y2 = map(int, xyxy[i])
+            track_id = int(ids[i])
+            cls_id = int(clss[i])
+            conf = confs[i]
+            label = class_names.get(cls_id, f"class{cls_id}")
+            if label == 'ball':
                 continue
-            track_id = track.track_id
-            l, t, w, h = map(int, track.to_ltrb())
-            cv2.rectangle(frame, (l, t), (l + w, t + h), (0, 255, 0), 2)
-            cv2.putText(frame, f"ID: {track_id}", (l, t - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            current_frame_track_ids.append(track_id)
+            global_id = assign_global_id(track_id, (x1, y1, x2, y2), frame, used_global_ids)
+            color = color_map.get(label, (128, 128, 128))
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness)
+            text = f"ID: {global_id}"
+            (tw, th), _ = cv2.getTextSize(text, font, font_scale, 1)
+            cv2.rectangle(annotated, (x1, y1 - th - 4), (x1 + tw + 4, y1), color, -1)
+            cv2.putText(annotated, text, (x1 + 2, y1 - 4), font, font_scale, (0, 0, 0), 1, cv2.LINE_AA)
+    retire_lost_tracks(current_frame_track_ids)
+    return annotated
 
-    cv2.imshow("Real-Time Re-ID", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+def run_tracking(video_path, model_path, output_dir, output_video_path):
+    model = YOLO(model_path)
+    class_names = model.names
+    cap = cv2.VideoCapture(video_path)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out_writer = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
+    frame_idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        results = model.track(source=frame, persist=True, conf=0.4, verbose=False)[0]
+        output_frame = draw_frame(frame, results, class_names)
+        cv2.imwrite(os.path.join(output_dir, f"frame_{frame_idx:04d}.jpg"), output_frame)
+        out_writer.write(output_frame)
+        frame_idx += 1
+    cap.release()
+    out_writer.release()
+    print(f"Processed {frame_idx} frames. Video saved to {output_video_path}")
 
-cap.release()
-cv2.destroyAllWindows()
-
-
+if __name__ == "__main__":
+    run_tracking(VIDEO_PATH, MODEL_PATH, OUTPUT_DIR, OUTPUT_VIDEO_PATH)
