@@ -9,7 +9,7 @@ import torch
 import torchreid
 
 VIDEO_PATH = "../input/15sec_input_720p.mp4"
-MODEL_PATH = "../input/best.pt"
+MODEL_PATH = "../models/best.pt"
 OUTPUT_DIR = "../output/tracked_frames"
 OUTPUT_VIDEO_PATH = "../output/tracked_video_reid_final.mp4"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
